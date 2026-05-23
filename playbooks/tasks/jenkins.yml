@@ -1,0 +1,272 @@
+---
+- name: Get running Jenkins version
+  shell: |
+    java -jar /usr/lib/jenkins/jenkins.war --version
+  register: current_version
+  failed_when: false
+
+- name: Get latest Jenkins version from Jenkins update API
+  uri:
+    url: https://updates.jenkins.io/stable/latestCore.txt
+    return_content: yes
+  register: jenkins_version
+
+- name: Extract latest version number
+  set_fact:
+    latest_version: "{{ jenkins_version.content | regex_replace('\\n', '') }}"
+
+- name: Extract current version number
+  set_fact:
+    current_version_clean: "{{ current_version.stdout | regex_replace('\\n', '') }}"
+
+- debug:
+    msg: "Current: {{ current_version_clean }}, Latest: {{ latest_version }}"
+
+- name: Check if upgrade is needed
+  set_fact:
+    upgrade_needed: "{{ current_version_clean != latest_version }}"
+
+- name: Skip upgrade if already on latest version
+  debug:
+    msg: "Jenkins is already on latest version {{ latest_version }}, skipping upgrade"
+  when: not upgrade_needed
+
+- name: Exit if no upgrade needed
+  meta: end_play
+  when: not upgrade_needed
+
+##################################################
+# STEP 1 - CHECK CURRENT JENKINS VERSION
+##################################################
+
+- name: Display current Jenkins version
+  debug:
+    msg: "Current Jenkins version: {{ current_version_clean }}"
+
+##################################################
+# STEP 2 - DOWNLOAD THE LATEST STABLE JENKINS WAR
+##################################################
+
+- name: Create temp directory for download
+  shell: |
+    mkdir -p /tmp/jenkins_upgrade
+  register: temp_dir
+
+- name: Download latest stable Jenkins WAR to temp directory
+  get_url:
+    url: https://get.jenkins.io/war-stable/latest/jenkins.war
+    dest: /tmp/jenkins_upgrade/jenkins.war
+    mode: '0644'
+    timeout: 300
+  register: download_war
+
+- name: Verify WAR file download
+  shell: |
+    ls -lh /tmp/jenkins_upgrade/jenkins.war
+  register: war_verify
+
+- debug:
+    var: war_verify.stdout
+
+##################################################
+# STEP 3 - STOP THE JENKINS SERVICE
+##################################################
+
+- name: Stop Jenkins service
+  systemd:
+    name: jenkins
+    state: stopped
+
+- name: Verify Jenkins service is stopped
+  shell: |
+    systemctl status jenkins --no-pager
+  register: stopped_status
+  failed_when: false
+
+- debug:
+    var: stopped_status.stdout
+
+##################################################
+# STEP 4 - BACKUP JENKINS
+##################################################
+
+- name: Backup Jenkins WAR file
+  shell: |
+    cp /usr/lib/jenkins/jenkins.war /usr/lib/jenkins/jenkins.war.bak
+  register: war_backup
+
+- name: Backup Jenkins Home Directory
+  shell: |
+    cp -r /var/lib/jenkins /var/lib/jenkins_backup_$(date +%F)
+  register: home_backup
+
+- name: Verify Jenkins home backup
+  shell: |
+    ls -ld /var/lib/jenkins_backup_*
+  register: home_backup_verify
+
+- debug:
+    var: home_backup_verify.stdout
+
+##################################################
+# STEP 5 - REPLACE THE OLD JENKINS WAR FILE
+##################################################
+
+- name: Replace the old Jenkins WAR file
+  shell: |
+    cp /tmp/jenkins_upgrade/jenkins.war /usr/lib/jenkins/jenkins.war
+  register: replace_war
+
+##################################################
+# STEP 6 - SET CORRECT OWNERSHIP AND PERMISSIONS
+##################################################
+
+- name: Set correct ownership for WAR file
+  shell: |
+    chown jenkins:jenkins /usr/lib/jenkins/jenkins.war
+  register: war_ownership
+
+- name: Set correct ownership for Jenkins home directory
+  shell: |
+    chown -R jenkins:jenkins /var/lib/jenkins
+  register: home_ownership
+
+- name: Set correct permissions for WAR file
+  shell: |
+    chmod 0644 /usr/lib/jenkins/jenkins.war
+  register: war_permissions
+
+##################################################
+# STEP 7 - START JENKINS SERVICE
+##################################################
+
+- name: Start Jenkins service
+  systemd:
+    name: jenkins
+    state: started
+    enabled: yes
+
+- name: Wait for Jenkins service to be active
+  systemd:
+    name: jenkins
+  register: service_status
+  until: service_status.status.ActiveState == "active"
+  retries: 30
+  delay: 10
+
+- name: Check Jenkins service status
+  shell: |
+    systemctl status jenkins --no-pager
+  register: running_status
+
+- debug:
+    var: running_status.stdout
+
+##################################################
+# STEP 8 - VERIFY THE UPGRADE
+##################################################
+
+- name: Verify upgraded Jenkins version
+  shell: |
+    java -jar /usr/lib/jenkins/jenkins.war --version
+  register: verify_version
+
+- debug:
+    var: verify_version.stdout
+
+##################################################
+# HEALTH CHECKS
+##################################################
+
+- name: Check Jenkins HTTP endpoint
+  uri:
+    url: http://localhost:8080
+    status_code: 200,302,403
+    timeout: 10
+  register: http_health
+  retries: 15
+  delay: 10
+  until: http_health.status in [200, 302, 403]
+
+- name: Verify Jenkins is responding
+  shell: |
+    curl -f http://localhost:8080/cli
+  register: jenkins_response
+  retries: 5
+  delay: 5
+
+- name: Check Jenkins process
+  shell: |
+    ps aux | grep jenkins | grep -v grep
+  register: jenkins_process
+  failed_when: jenkins_process.rc != 0
+
+##################################################
+# VERIFY
+##################################################
+
+- name: Verify Jenkins service
+  shell: systemctl status jenkins
+  register: jenkins_verify
+
+- debug:
+    var: jenkins_verify.stdout
+
+##################################################
+# TROUBLESHOOTING
+##################################################
+
+- name: Check Jenkins logs if there are issues
+  shell: |
+    journalctl -u jenkins -xe -n 50 --no-pager
+  register: jenkins_logs
+  failed_when: false
+
+- debug:
+    var: jenkins_logs.stdout
+  when: jenkins_verify.rc != 0
+
+##################################################
+# ROLLBACK ON FAILURE
+##################################################
+
+- name: Stop Jenkins service for rollback
+  systemd:
+    name: jenkins
+    state: stopped
+  when: jenkins_verify.rc != 0
+
+- name: Restore backup WAR file
+  shell: |
+    cp /usr/lib/jenkins/jenkins.war.bak /usr/lib/jenkins/jenkins.war
+  when: jenkins_verify.rc != 0
+
+- name: Set correct ownership for restored WAR file
+  shell: |
+    chown jenkins:jenkins /usr/lib/jenkins/jenkins.war
+  when: jenkins_verify.rc != 0
+
+- name: Start Jenkins service with previous version
+  systemd:
+    name: jenkins
+    state: started
+  when: jenkins_verify.rc != 0
+
+- name: Wait for Jenkins rollback service to be active
+  systemd:
+    name: jenkins
+  register: rollback_service_status
+  until: rollback_service_status.status.ActiveState == "active"
+  retries: 30
+  delay: 10
+  when: jenkins_verify.rc != 0
+
+- name: Check rollback logs
+  shell: |
+    journalctl -u jenkins -n 200 --no-pager
+  register: rollback_logs
+  when: jenkins_verify.rc != 0
+
+- debug:
+    var: rollback_logs.stdout
+  when: jenkins_verify.rc != 0
