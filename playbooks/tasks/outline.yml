@@ -1,0 +1,233 @@
+---
+- name: Get running Outline version
+  shell: |
+    docker compose -f /app/outline/docker-compose.yml images
+  register: current_version
+  failed_when: false
+
+- name: Get latest Outline version from GitHub API
+  uri:
+    url: https://api.github.com/repos/outline/outline/releases/latest
+    return_content: yes
+  register: latest_release
+
+- name: Extract latest version number
+  set_fact:
+    latest_version: "{{ latest_release.json.tag_name | regex_replace('v', '') }}"
+
+- name: Extract current version from docker images output
+  set_fact:
+    current_version_clean: "{{ current_version.stdout | regex_search('(\\d+\\.\\d+\\.\\d+)') | default('0.0.0', true) }}"
+
+- debug:
+    msg: "Current: {{ current_version_clean }}, Latest: {{ latest_version }}"
+
+- name: Check if upgrade is needed
+  set_fact:
+    upgrade_needed: "{{ current_version_clean != latest_version }}"
+
+- name: Skip upgrade if already on latest version
+  debug:
+    msg: "Outline is already on latest version {{ latest_version }}, skipping upgrade"
+  when: not upgrade_needed
+
+- name: Exit if no upgrade needed
+  meta: end_play
+  when: not upgrade_needed
+
+##################################################
+# BACKUP BEFORE UPGRADE
+##################################################
+
+- name: Backup PostgreSQL database
+  shell: |
+    cd /app/outline && \
+    docker exec -t outline-postgres-1 pg_dump -U user outline > /app/outline/outline_backup_$(date +%F).sql
+  register: db_backup
+
+- name: Verify database backup
+  shell: |
+    ls -lh /app/outline/outline_backup_*.sql | head -1
+  register: db_backup_verify
+
+- debug:
+    var: db_backup_verify.stdout
+
+- name: Backup docker.env configuration
+  shell: |
+    cd /app/outline && cp docker.env docker.env.bak_$(date +%F)
+  register: env_backup
+
+- name: Backup docker-compose.yml
+  shell: |
+    cd /app/outline && cp docker-compose.yml docker-compose.yml.bak_$(date +%F)
+  register: compose_backup
+
+- name: Note about S3 storage
+  debug:
+    msg: "Storage is on S3, no local file backup needed"
+
+##################################################
+# UPGRADE STEPS
+##################################################
+
+- name: Pull the latest Outline Docker image
+  shell: |
+    cd /app/outline && docker compose pull outline
+  register: pull_image
+
+- name: Restart the stack - stop
+  shell: |
+    cd /app/outline && docker compose down
+  register: stop_stack
+
+- name: Restart the stack - start
+  shell: |
+    cd /app/outline && docker compose up -d
+  register: start_stack
+
+- name: Wait for PostgreSQL to be ready
+  shell: |
+    docker exec outline-postgres-1 pg_isready -U user
+  register: db_ready
+  retries: 15
+  delay: 5
+  until: db_ready.rc == 0
+
+- name: Run database migrations
+  shell: |
+    cd /app/outline && docker compose exec outline yarn db:migrate
+  register: db_migrations
+
+- debug:
+    var: db_migrations.stdout
+
+##################################################
+# VERIFICATION
+##################################################
+
+- name: Wait for Outline to be ready
+  wait_for:
+    host: 127.0.0.1
+    port: 3000
+    delay: 20
+    timeout: 300
+
+- name: Check Outline HTTP endpoint
+  uri:
+    url: http://localhost:3000
+    status_code: 200,302
+    timeout: 10
+  register: http_health
+  retries: 10
+  delay: 10
+  until: http_health.status in [200, 302]
+
+- name: Verify Outline container health
+  shell: |
+    docker ps --filter "name=outline" --format "{{.Status}}"
+  register: container_status
+  until: "'healthy' in container_status.stdout or 'Up' in container_status.stdout"
+  retries: 15
+  delay: 5
+
+- name: Check Outline version via API
+  uri:
+    url: http://localhost:3000/api/config
+    timeout: 10
+  register: api_config
+  failed_when: false
+
+- name: Check Outline logs
+  shell: |
+    docker compose -f /app/outline/docker-compose.yml logs outline --tail 50
+  register: outline_logs
+
+- debug:
+    var: outline_logs.stdout
+
+##################################################
+# VERIFY
+##################################################
+
+- name: Verify Outline container
+  shell: docker ps | grep outline
+  register: outline_verify
+
+- debug:
+    var: outline_verify.stdout
+
+##################################################
+# ROLLBACK ON FAILURE
+##################################################
+
+- name: Find latest database backup
+  shell: |
+    ls -t /app/outline/outline_backup_*.sql | head -1
+  register: latest_db_backup
+  failed_when: false
+
+- name: Find latest docker.env backup
+  shell: |
+    ls -t /app/outline/docker.env.bak_* | head -1
+  register: latest_env_backup
+  failed_when: false
+
+- name: Find latest docker-compose.yml backup
+  shell: |
+    ls -t /app/outline/docker-compose.yml.bak_* | head -1
+  register: latest_compose_backup
+  failed_when: false
+
+- name: Stop Outline stack
+  shell: |
+    cd /app/outline && docker compose down
+  when: 
+    - outline_verify.rc != 0
+    - latest_compose_backup.stdout is defined
+
+- name: Restore docker-compose.yml
+  shell: |
+    cp {{ latest_compose_backup.stdout }} /app/outline/docker-compose.yml
+  when: 
+    - outline_verify.rc != 0
+    - latest_compose_backup.stdout is defined
+
+- name: Restore docker.env
+  shell: |
+    cp {{ latest_env_backup.stdout }} /app/outline/docker.env
+  when: 
+    - outline_verify.rc != 0
+    - latest_env_backup.stdout is defined
+
+- name: Restore database from backup
+  shell: |
+    cd /app/outline && \
+    docker exec -i outline-postgres-1 psql -U user outline < {{ latest_db_backup.stdout }}
+  when: 
+    - outline_verify.rc != 0
+    - latest_db_backup.stdout is defined
+
+- name: Pull previous image
+  shell: |
+    cd /app/outline && docker compose pull outline
+  when: 
+    - outline_verify.rc != 0
+    - latest_compose_backup.stdout is defined
+
+- name: Start Outline with previous version
+  shell: |
+    cd /app/outline && docker compose up -d
+  when: 
+    - outline_verify.rc != 0
+    - latest_compose_backup.stdout is defined
+
+- name: Wait for Outline rollback to be ready
+  wait_for:
+    host: 127.0.0.1
+    port: 3000
+    delay: 20
+    timeout: 300
+  when: 
+    - outline_verify.rc != 0
+    - latest_compose_backup.stdout is defined
