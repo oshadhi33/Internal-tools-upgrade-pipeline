@@ -1,0 +1,304 @@
+---
+- name: Get running Gogs version
+  shell: |
+    /mnt/HC_Volume_103566898/gogs/gogs --version
+  register: current_version
+  failed_when: false
+
+- name: Get latest Gogs version from GitHub API
+  uri:
+    url: https://api.github.com/repos/gogs/gogs/releases/latest
+    return_content: yes
+  register: gogs_release
+
+- name: Extract latest version number
+  set_fact:
+    latest_version: "{{ gogs_release.json.tag_name | regex_replace('v', '') }}"
+
+- name: Extract current version number
+  set_fact:
+    current_version_clean: "{{ current_version.stdout | regex_search('(\\d+\\.\\d+\\.\\d+)') | default('0.0.0', true) }}"
+
+- debug:
+    msg: "Current: {{ current_version_clean }}, Latest: {{ latest_version }}"
+
+- name: Check if upgrade is needed
+  set_fact:
+    upgrade_needed: "{{ current_version_clean != latest_version }}"
+
+- name: Skip upgrade if already on latest version
+  debug:
+    msg: "Gogs is already on latest version {{ latest_version }}, skipping upgrade"
+  when: not upgrade_needed
+
+- name: Exit if no upgrade needed
+  meta: end_play
+  when: not upgrade_needed
+
+##################################################
+# STEP 1 - VERIFY CURRENT STATE
+##################################################
+
+- name: Check Gogs service status
+  shell: |
+    systemctl status gogs.service --no-pager
+  register: service_status
+
+- debug:
+    var: service_status.stdout
+
+- name: Check Gogs process
+  shell: |
+    ps aux | grep '[g]ogs'
+  register: gogs_process
+
+- debug:
+    var: gogs_process.stdout
+
+##################################################
+# STEP 2 - BACKUPS
+##################################################
+
+- name: Backup Gogs filesystem
+  shell: |
+    cd /mnt/HC_Volume_103566898 && \
+    tar -czf /root/gogs_fs_backup_$(date +%F_%H%M%S).tar.gz gogs
+  register: fs_backup
+
+- name: Verify filesystem backup
+  shell: |
+    ls -lh /root/gogs_fs_backup_*.tar.gz | head -1
+  register: fs_backup_verify
+
+- debug:
+    var: fs_backup_verify.stdout
+
+- name: Backup Gogs database
+  shell: |
+    cp -av /mnt/HC_Volume_103566898/gogs.sql /root/gogs_db_backup_$(date +%F_%H%M%S).sql
+  register: db_backup
+
+- name: Verify database backup
+  shell: |
+    ls -lh /root/gogs_db_backup_*.sql | head -1
+  register: db_backup_verify
+
+- debug:
+    var: db_backup_verify.stdout
+
+##################################################
+# STEP 3 - DOWNLOAD AND STAGE NEW GOGS VERSION
+##################################################
+
+- name: Create upgrade directory
+  shell: |
+    mkdir -p /root/gogs_upgrade
+
+- name: Get latest Gogs download URL for linux_amd64
+  uri:
+    url: https://api.github.com/repos/gogs/gogs/releases/latest
+    return_content: yes
+  register: gogs_release
+
+- name: Find linux_amd64 download URL
+  set_fact:
+    gogs_download_url: "{{ item.browser_download_url }}"
+  loop: "{{ gogs_release.json.assets }}"
+  when: "'linux_amd64' in item.browser_download_url"
+
+- debug:
+    var: gogs_download_url
+
+- name: Download latest Gogs version
+  get_url:
+    url: "{{ gogs_download_url }}"
+    dest: /root/gogs_upgrade/gogs_latest.tar.gz
+    mode: '0644'
+
+- name: Extract Gogs binary
+  shell: |
+    cd /root/gogs_upgrade && \
+    tar -xzf gogs_latest.tar.gz
+
+- name: Verify downloaded binary
+  shell: |
+    /root/gogs_upgrade/gogs/gogs --version
+  register: new_version
+
+- debug:
+    var: new_version.stdout
+
+##################################################
+# STEP 4 - STOP GOGS SERVICE
+##################################################
+
+- name: Stop Gogs service
+  systemd:
+    name: gogs.service
+    state: stopped
+
+- name: Verify Gogs service is stopped
+  shell: |
+    systemctl status gogs.service --no-pager
+  register: stopped_status
+
+- debug:
+    var: stopped_status.stdout
+
+##################################################
+# STEP 5 - BINARY SWAP
+##################################################
+
+- name: Backup existing binary with version
+  shell: |
+    cd /mnt/HC_Volume_103566898/gogs && \
+    cp -av gogs gogs.bin_{{ current_version_clean }}_$(date +%F_%H%M%S)
+  register: binary_backup
+
+- name: Install new binary
+  shell: |
+    cp -av /root/gogs_upgrade/gogs/gogs /mnt/HC_Volume_103566898/gogs/gogs
+  register: binary_install
+
+- name: Set proper ownership
+  shell: |
+    chown git:git /mnt/HC_Volume_103566898/gogs/gogs
+  register: ownership_set
+
+- name: Set proper permissions
+  shell: |
+    chmod 0755 /mnt/HC_Volume_103566898/gogs/gogs
+  register: permissions_set
+
+##################################################
+# STEP 6 - START SERVICE AND MONITOR
+##################################################
+
+- name: Start Gogs service
+  systemd:
+    name: gogs.service
+    state: started
+    enabled: yes
+
+- name: Wait for Gogs service to be active
+  systemd:
+    name: gogs.service
+  register: service_status
+  until: service_status.status.ActiveState == "active"
+  retries: 30
+  delay: 10
+
+- name: Check Gogs service status
+  shell: |
+    systemctl status gogs.service --no-pager
+  register: running_status
+
+- debug:
+    var: running_status.stdout
+
+- name: Verify new Gogs version
+  shell: |
+    /mnt/HC_Volume_103566898/gogs/gogs --version
+  register: verify_version
+
+- debug:
+    var: verify_version.stdout
+
+##################################################
+# HEALTH CHECKS
+##################################################
+
+- name: Check Gogs HTTP endpoint
+  uri:
+    url: http://localhost:3000
+    status_code: 200,302
+    timeout: 10
+  register: http_health
+  retries: 15
+  delay: 10
+  until: http_health.status in [200, 302]
+
+- name: Verify Gogs process is running
+  shell: |
+    ps aux | grep '[g]ogs'
+  register: gogs_process
+  failed_when: gogs_process.rc != 0
+
+- name: Check Gogs logs for errors
+  shell: |
+    journalctl -u gogs.service -n 50 --no-pager
+  register: gogs_logs
+
+- debug:
+    var: gogs_logs.stdout
+
+##################################################
+# VERIFY
+##################################################
+
+- name: Verify Gogs service
+  shell: systemctl status gogs.service
+  register: gogs_verify
+
+- debug:
+    var: gogs_verify.stdout
+
+##################################################
+# ROLLBACK ON FAILURE
+##################################################
+
+- name: Find latest binary backup
+  shell: |
+    ls -t /mnt/HC_Volume_103566898/gogs/gogs.bin_* | head -1
+  register: latest_binary_backup
+  failed_when: false
+
+- name: Stop Gogs service
+  systemd:
+    name: gogs.service
+    state: stopped
+  when: 
+    - gogs_verify.rc != 0
+    - latest_binary_backup.stdout is defined
+
+- name: Restore backup binary
+  shell: |
+    cd /mnt/HC_Volume_103566898/gogs && \
+    cp -av {{ latest_binary_backup.stdout }} gogs
+  when: 
+    - gogs_verify.rc != 0
+    - latest_binary_backup.stdout is defined
+
+- name: Start Gogs service with previous version
+  systemd:
+    name: gogs.service
+    state: started
+    enabled: yes
+  when: 
+    - gogs_verify.rc != 0
+    - latest_binary_backup.stdout is defined
+
+- name: Wait for Gogs rollback service to be active
+  systemd:
+    name: gogs.service
+  register: rollback_service_status
+  until: rollback_service_status.status.ActiveState == "active"
+  retries: 30
+  delay: 10
+  when: 
+    - gogs_verify.rc != 0
+    - latest_binary_backup.stdout is defined
+
+- name: Check rollback logs
+  shell: |
+    journalctl -u gogs.service -n 200 --no-pager
+  register: rollback_logs
+  when: 
+    - gogs_verify.rc != 0
+    - latest_binary_backup.stdout is defined
+
+- debug:
+    var: rollback_logs.stdout
+  when: 
+    - gogs_verify.rc != 0
+    - latest_binary_backup.stdout is defined
