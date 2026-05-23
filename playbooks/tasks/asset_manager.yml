@@ -1,0 +1,263 @@
+---
+- name: Get running Asset Manager version
+  shell: |
+    docker images snipe/snipe-it --format "{{.Tag}}"
+  register: current_version
+  failed_when: false
+
+- name: Get latest Asset Manager version from GitHub API
+  uri:
+    url: https://api.github.com/repos/snipe/snipe-it/releases/latest
+    return_content: yes
+  register: latest_release
+
+- name: Extract latest version number
+  set_fact:
+    latest_version: "{{ latest_release.json.tag_name | regex_replace('v', '') }}"
+
+- name: Extract current version from docker images output
+  set_fact:
+    current_version_clean: "{{ current_version.stdout | regex_search('(\\d+\\.\\d+\\.\\d+)') | default('0.0.0', true) }}"
+
+- debug:
+    msg: "Current: {{ current_version_clean }}, Latest: {{ latest_version }}"
+
+- name: Check if upgrade is needed
+  set_fact:
+    upgrade_needed: "{{ current_version_clean != latest_version }}"
+
+- name: Skip upgrade if already on latest version
+  debug:
+    msg: "Asset Manager is already on latest version {{ latest_version }}, skipping upgrade"
+  when: not upgrade_needed
+
+- name: Exit if no upgrade needed
+  meta: end_play
+  when: not upgrade_needed
+
+##################################################
+# BACKUP COMPOSE FILE
+##################################################
+
+- name: Backup docker-compose file
+  shell: |
+    cp /apps/snipe-it/docker-compose.yml \
+    /apps/snipe-it/docker-compose.yml.bak_$(date +%F_%H%M%S)
+
+- name: Get MySQL root password from environment
+  shell: |
+    grep MYSQL_ROOT_PASSWORD /apps/snipe-it/.env.docker | cut -d '=' -f2
+  register: mysql_root_password
+  no_log: true
+
+##################################################
+# BACKUP DATABASE
+##################################################
+
+- name: Backup Snipe-IT database
+  shell: |
+    cd /apps/snipe-it && \
+    docker exec snipe-it-mariadb-1 sh -c 'mysqldump -u root -p"{{ mysql_root_password.stdout }}" snipeit' > /root/snipeit_db_backup_$(date +%F).sql
+  register: db_backup
+
+- name: Verify database backup
+  shell: |
+    ls -lh /root/snipeit_db_backup_*.sql | head -1
+  register: db_backup_verify
+
+- debug:
+    var: db_backup_verify.stdout
+
+##################################################
+# BACKUP VOLUMES AND ENVIRONMENT
+##################################################
+
+- name: Backup database folder
+  shell: |
+    cd /apps/snipe-it && \
+    tar czf /root/snipeit_db_folder_backup_$(date +%F).tar.gz ./db
+  register: db_folder_backup
+
+- name: Backup logs
+  shell: |
+    cd /apps/snipe-it && \
+    tar czf /root/snipeit_logs_backup_$(date +%F).tar.gz ./logs
+  register: logs_backup
+
+- name: Backup environment file
+  shell: |
+    cp /apps/snipe-it/.env.docker /root/snipeit_env_backup_$(date +%F)
+  register: env_backup
+
+##################################################
+# STOP EXISTING CONTAINERS
+##################################################
+
+- name: Stop Asset Manager containers
+  shell: |
+    cd /apps/snipe-it && \
+    docker stop snipeit snipe-it-mariadb-1 snipe-it-redis-1 snipe-it-mailhog-1 || true
+  register: stop_containers
+
+##################################################
+# UPDATE VERSION
+##################################################
+
+- name: Update Asset Manager image version
+  shell: |
+    cd /apps/snipe-it && sed -i.bak 's|snipe/snipe-it:.*|snipe/snipe-it:latest|g' docker-compose.yml && rm -f docker-compose.yml.bak
+
+##################################################
+# PULL LATEST IMAGE
+##################################################
+
+- name: Pull latest Snipe-IT image
+  shell: |
+    cd /apps/snipe-it && docker compose pull snipeit
+  register: pull_image
+
+- name: Check pulled image version
+  shell: |
+    docker images snipe/snipe-it --format "{{.Repository}}:{{.Tag}}"
+  register: image_version
+
+- debug:
+    var: image_version.stdout
+
+##################################################
+# RESTART CONTAINERS
+##################################################
+
+- name: Start Asset Manager stack
+  shell: |
+    cd /apps/snipe-it && docker compose up -d
+  register: start_containers
+
+##################################################
+# RUN DATABASE MIGRATIONS
+##################################################
+
+- name: Wait for database to be ready
+  shell: |
+    docker exec snipe-it-mariadb-1 sh -c 'mysqladmin ping -h localhost -u root -p"{{ mysql_root_password.stdout }}"'
+  register: db_ready
+  retries: 15
+  delay: 5
+  until: db_ready.rc == 0
+
+- name: Run database migrations
+  shell: |
+    docker exec -it snipeit php /var/www/html/artisan migrate --force
+  register: db_migrations
+
+- name: Clear and cache config
+  shell: |
+    docker exec -it snipeit php /var/www/html/artisan config:cache && \
+    docker exec -it snipeit php /var/www/html/artisan cache:clear
+  register: cache_clear
+
+##################################################
+# HEALTH CHECK
+##################################################
+
+- name: Wait for Asset Manager to be ready
+  uri:
+    url: https://assets.****.com
+    status_code: 200
+    timeout: 10
+    validate_certs: false
+  register: http_status
+  retries: 30
+  delay: 10
+  until: http_status.status == 200
+
+- name: Verify Asset Manager container health
+  shell: |
+    docker ps --filter "name=snipe-it" --format "{{.Status}}"
+  register: container_status
+  until: "'healthy' in container_status.stdout or 'Up' in container_status.stdout"
+  retries: 15
+  delay: 5
+
+- name: Check Snipe-IT logs
+  shell: |
+    docker logs snipeit --tail 50
+  register: app_logs
+
+- debug:
+    var: app_logs.stdout
+
+##################################################
+# VERIFY
+##################################################
+
+- name: Verify Asset Manager container
+  shell: docker ps | grep snipe-it
+  register: asset_manager_verify
+
+- debug:
+    var: asset_manager_verify.stdout
+
+##################################################
+# ROLLBACK ON FAILURE
+##################################################
+
+- name: Find latest database backup
+  shell: |
+    ls -t /root/snipeit_db_backup_*.sql | head -1
+  register: latest_db_backup
+  failed_when: false
+
+- name: Stop upgraded container
+  shell: |
+    cd /apps/snipe-it && docker stop snipeit || true
+  when: 
+    - asset_manager_verify.rc != 0
+    - latest_db_backup.stdout is defined
+
+- name: Restore database from backup
+  shell: |
+    docker exec -i snipe-it-mariadb-1 sh -c 'mysql -u root -p"{{ mysql_root_password.stdout }}" snipeit' < {{ latest_db_backup.stdout }}
+  when: 
+    - asset_manager_verify.rc != 0
+    - latest_db_backup.stdout is defined
+
+- name: Find latest backup compose file
+  shell: |
+    ls -t /apps/snipe-it/docker-compose.yml.bak_* | head -1
+  register: latest_backup
+  failed_when: false
+  when: asset_manager_verify.rc != 0
+
+- name: Restore backup compose file
+  shell: |
+    cp {{ latest_backup.stdout }} /apps/snipe-it/docker-compose.yml
+  when: 
+    - asset_manager_verify.rc != 0
+    - latest_backup.stdout is defined
+
+- name: Pull previous image
+  shell: |
+    cd /apps/snipe-it && docker compose pull
+  when: 
+    - asset_manager_verify.rc != 0
+    - latest_backup.stdout is defined
+
+- name: Start Asset Manager with previous version
+  shell: |
+    cd /apps/snipe-it && docker compose up -d
+  when: 
+    - asset_manager_verify.rc != 0
+    - latest_backup.stdout is defined
+
+- name: Wait for Asset Manager rollback to be ready
+  uri:
+    url: https://assets.*****.com
+    status_code: 200
+  register: rollback_http_status
+  until: rollback_http_status.status == 200
+  retries: 30
+  delay: 10
+  when: 
+    - asset_manager_verify.rc != 0
+    - latest_backup.stdout is defined
