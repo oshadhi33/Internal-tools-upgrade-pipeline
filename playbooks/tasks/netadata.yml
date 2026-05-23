@@ -1,0 +1,266 @@
+---
+- name: Get running Netdata version
+  shell: |
+    docker exec netdata netdata -v
+  register: current_version
+  failed_when: false
+
+- name: Get latest Netdata version from GitHub API
+  uri:
+    url: https://api.github.com/repos/netdata/netdata/releases/latest
+    return_content: yes
+  register: latest_release
+
+- name: Extract latest version number
+  set_fact:
+    latest_version: "{{ latest_release.json.tag_name | regex_replace('v', '') }}"
+
+- name: Extract current version number
+  set_fact:
+    current_version_clean: "{{ current_version.stdout | regex_search('(\\d+\\.\\d+\\.\\d+)') | default('0.0.0', true) }}"
+
+- debug:
+    msg: "Current: {{ current_version_clean }}, Latest: {{ latest_version }}"
+
+- name: Check if upgrade is needed
+  set_fact:
+    upgrade_needed: "{{ current_version_clean != latest_version }}"
+
+- name: Skip upgrade if already on latest version
+  debug:
+    msg: "Netdata is already on latest version {{ latest_version }}, skipping upgrade"
+  when: not upgrade_needed
+
+- name: Exit if no upgrade needed
+  meta: end_play
+  when: not upgrade_needed
+
+##################################################
+# BACKUP COMPOSE FILE
+##################################################
+
+- name: Backup docker-compose file
+  shell: |
+    cp /app/netdata/docker-compose.yml \
+    /app/netdata/docker-compose.yml.bak_$(date +%F_%H%M%S)
+
+##################################################
+# BACKUP NETDATA DATA
+##################################################
+
+- name: Create backup directory
+  shell: |
+    mkdir -p /app/netdata/backups
+
+- name: Backup netdata_config volume
+  shell: |
+    docker run --rm -v netdata_config:/data -v /app/netdata/backups:/backup alpine tar czf /backup/netdata_config_backup_$(date +%F).tar.gz -C /data .
+  register: config_backup
+
+- name: Backup netdata_lib volume
+  shell: |
+    docker run --rm -v netdata_lib:/data -v /app/netdata/backups:/backup alpine tar czf /backup/netdata_lib_backup_$(date +%F).tar.gz -C /data .
+  register: lib_backup
+
+- name: Backup netdata_cache volume
+  shell: |
+    docker run --rm -v netdata_cache:/data -v /app/netdata/backups:/backup alpine tar czf /backup/netdata_cache_backup_$(date +%F).tar.gz -C /data .
+  register: cache_backup
+
+- name: Verify backups were created
+  shell: |
+    ls -lh /app/netdata/backups/
+  register: backup_verify
+
+- debug:
+    var: backup_verify.stdout
+
+##################################################
+# STOP OR REMOVE EXISTING NETDATA CONTAINER
+##################################################
+
+- name: Check for running Netdata container
+  shell: |
+    docker ps -a | grep netdata
+  register: netdata_container
+  failed_when: false
+
+- name: Get Netdata container ID/name
+  shell: |
+    docker ps -a --filter "name=netdata" --format "{{.ID}}"
+  register: container_id
+  failed_when: false
+
+- name: Remove existing Netdata container
+  shell: |
+    docker rm {{ container_id.stdout }} || true
+  when: container_id.stdout is defined
+  register: remove_container
+
+##################################################
+# PULL LATEST NETDATA IMAGE
+##################################################
+
+- name: Update Netdata image version in compose file
+  shell: |
+    cd /app/netdata && sed -i.bak 's|netdata/netdata:.*|netdata/netdata:latest|g' docker-compose.yml && rm -f docker-compose.yml.bak
+
+- name: Pull latest Netdata image
+  shell: |
+    cd /app/netdata && docker-compose -f docker-compose.yml pull netdata
+  register: pull_image
+
+##################################################
+# START THE UPGRADED CONTAINER
+##################################################
+
+- name: Start upgraded Netdata container
+  shell: |
+    cd /app/netdata && docker-compose -f docker-compose.yml up -d netdata
+  register: start_container
+
+##################################################
+# VERIFY THE UPGRADE
+##################################################
+
+- name: Check container status
+  shell: |
+    docker ps | grep netdata
+  register: container_status
+
+- debug:
+    var: container_status.stdout
+
+- name: Check Netdata logs for errors
+  shell: |
+    docker logs netdata --tail 50
+  register: netdata_logs
+
+- debug:
+    var: netdata_logs.stdout
+
+- name: Check Netdata version
+  shell: |
+    docker exec -it netdata netdata -v
+  register: new_version
+
+- debug:
+    var: new_version.stdout
+
+- name: Wait for Netdata container to be healthy
+  shell: |
+    docker inspect --format='{{.State.Health.Status}}' netdata
+  register: health_status
+  until: health_status.stdout == "healthy"
+  retries: 30
+  delay: 10
+
+- name: Check Netdata HTTP endpoint
+  uri:
+    url: http://localhost:19999/api/health
+    status_code: 200
+    timeout: 10
+  register: http_health
+  retries: 5
+  delay: 5
+  until: http_health.status == 200
+
+##################################################
+# VERIFY
+##################################################
+
+- name: Verify Netdata container
+  shell: docker ps | grep netdata
+  register: netdata_verify
+
+- debug:
+    var: netdata_verify.stdout
+
+##################################################
+# ROLLBACK ON FAILURE
+##################################################
+
+- name: Find latest config backup
+  shell: |
+    ls -t /app/netdata/backups/netdata_config_backup_*.tar.gz | head -1
+  register: latest_config_backup
+  failed_when: false
+
+- name: Find latest lib backup
+  shell: |
+    ls -t /app/netdata/backups/netdata_lib_backup_*.tar.gz | head -1
+  register: latest_lib_backup
+  failed_when: false
+
+- name: Find latest cache backup
+  shell: |
+    ls -t /app/netdata/backups/netdata_cache_backup_*.tar.gz | head -1
+  register: latest_cache_backup
+  failed_when: false
+
+- name: Stop the new container
+  shell: |
+    cd /app/netdata && docker-compose -f docker-compose.yml stop netdata || true
+  when: 
+    - netdata_verify.rc != 0
+    - latest_config_backup.stdout is defined
+
+- name: Restore netdata_config backup
+  shell: |
+    docker run --rm -v netdata_config:/data -v /app/netdata/backups:/backup alpine tar xzf {{ latest_config_backup.stdout }} -C /data
+  when: 
+    - netdata_verify.rc != 0
+    - latest_config_backup.stdout is defined
+
+- name: Restore netdata_lib backup
+  shell: |
+    docker run --rm -v netdata_lib:/data -v /app/netdata/backups:/backup alpine tar xzf {{ latest_lib_backup.stdout }} -C /data
+  when: 
+    - netdata_verify.rc != 0
+    - latest_lib_backup.stdout is defined
+
+- name: Restore netdata_cache backup
+  shell: |
+    docker run --rm -v netdata_cache:/data -v /app/netdata/backups:/backup alpine tar xzf {{ latest_cache_backup.stdout }} -C /data
+  when: 
+    - netdata_verify.rc != 0
+    - latest_cache_backup.stdout is defined
+
+- name: Find latest backup compose file
+  shell: |
+    ls -t /app/netdata/docker-compose.yml.bak_* | head -1
+  register: latest_backup
+  failed_when: false
+  when: netdata_verify.rc != 0
+
+- name: Restore backup compose file
+  shell: |
+    cp {{ latest_backup.stdout }} /app/netdata/docker-compose.yml
+  when: 
+    - netdata_verify.rc != 0
+    - latest_backup.stdout is defined
+
+- name: Pull previous image
+  shell: |
+    cd /app/netdata && docker-compose -f docker-compose.yml pull netdata
+  when: 
+    - netdata_verify.rc != 0
+    - latest_backup.stdout is defined
+
+- name: Start Netdata with previous version
+  shell: |
+    cd /app/netdata && docker-compose -f docker-compose.yml up -d netdata
+  when: 
+    - netdata_verify.rc != 0
+    - latest_backup.stdout is defined
+
+- name: Wait for Netdata rollback to be healthy
+  shell: |
+    docker inspect --format='{{.State.Health.Status}}' netdata
+  register: rollback_health_status
+  until: rollback_health_status.stdout == "healthy"
+  retries: 30
+  delay: 10
+  when: 
+    - netdata_verify.rc != 0
+    - latest_backup.stdout is defined
