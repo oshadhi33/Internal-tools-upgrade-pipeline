@@ -1,0 +1,211 @@
+---
+- name: Get running Appsmith version
+  shell: |
+    docker ps --format "{{ '{{' }}.Image{{ '}}' }}" | grep appsmith
+  register: current_version
+  failed_when: false
+
+- name: Extract current version from image tag
+  set_fact:
+    current_version_clean: "{{ current_version.stdout | regex_search('(\\d+\\.\\d+\\.\\d+)') | default('0.0.0', true) }}"
+
+- name: Get latest Appsmith version from Docker Hub API
+  uri:
+    url: https://hub.docker.com/v2/repositories/appsmith/appsmith-ce/tags
+    return_content: yes
+  register: docker_hub_response
+
+- name: Extract latest version from Docker Hub response
+  set_fact:
+    latest_version: "{{ (docker_hub_response.json.results | first).name }}"
+
+- debug:
+    msg: "Current: {{ current_version_clean }}, Latest: {{ latest_version }}"
+
+- name: Check if upgrade is needed
+  set_fact:
+    upgrade_needed: "{{ current_version_clean != latest_version }}"
+
+- name: Skip upgrade if already on latest version
+  debug:
+    msg: "Appsmith is already on latest version {{ latest_version }}, skipping upgrade"
+  when: not upgrade_needed
+
+- name: Exit if no upgrade needed
+  meta: end_play
+  when: not upgrade_needed
+
+##################################################
+# EC2 SNAPSHOT
+##################################################
+
+- name: Check AWS credentials
+  shell: aws sts get-caller-identity
+  register: aws_check
+  failed_when: false
+  ignore_errors: true
+
+- name: Set AWS credentials from environment
+  shell: |
+    export AWS_ACCESS_KEY_ID={{ lookup('env', 'AWS_ACCESS_KEY_ID') }}
+    export AWS_SECRET_ACCESS_KEY={{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}
+    export AWS_DEFAULT_REGION={{ lookup('env', 'AWS_DEFAULT_REGION', 'us-east-1') }}
+  when: aws_check.rc != 0
+
+- name: Set volume IDs from environment or use defaults
+  set_fact:
+    appsmith_volumes:
+      - "{{ lookup('env', 'APPSMITH_VOLUME_ID_1', 'vol-*******') }}"
+      - "{{ lookup('env', 'APPSMITH_VOLUME_ID_2', 'vol-*******) }}"
+
+- debug:
+    msg: "Creating snapshots for volumes: {{ appsmith_volumes }}"
+
+- name: Create EC2 snapshots for all volumes
+  shell: |
+    aws ec2 create-snapshot \
+      --volume-id {{ item }} \
+      --description "Appsmith backup $(date +%F_%H%M%S) - volume {{ item }}"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+    AWS_DEFAULT_REGION: "{{ lookup('env', 'AWS_DEFAULT_REGION', 'us-east-1') }}"
+  loop: "{{ appsmith_volumes }}"
+  register: snapshot_output
+  loop_control:
+    label: "{{ item }}"
+
+- debug:
+    msg: "Snapshot created for volume: {{ item.item }} - Snapshot ID: {{ item.stdout | regex_search('snap-[a-f0-9]+') | default('unknown', true) }}"
+  loop: "{{ snapshot_output.results }}"
+  when: snapshot_output.results is defined
+
+##################################################
+# BACKUP COMPOSE FILE
+##################################################
+
+- name: Backup docker-compose file
+  shell: |
+    cp docker-compose.yml \
+    docker-compose.yml.bak_$(date +%F_%H%M%S)
+
+##################################################
+# STOP SERVICES
+##################################################
+
+- name: Stop Appsmith stack
+  shell: docker compose down
+
+##################################################
+# UPDATE VERSION
+##################################################
+
+- name: Update Appsmith image version
+  shell: |
+    sed -i.bak 's|appsmith/appsmith-ce:.*|appsmith/appsmith-ce:latest|g' docker-compose.yml && rm -f docker-compose.yml.bak
+
+##################################################
+# PULL NEW IMAGE
+##################################################
+
+- name: Pull latest Appsmith image
+  shell: docker compose pull
+
+##################################################
+# START SERVICES
+##################################################
+
+- name: Start Appsmith
+  shell: docker compose up -d
+
+##################################################
+# HEALTH CHECK
+##################################################
+
+- name: Wait for Appsmith
+  wait_for:
+    host: 127.0.0.1
+    port: 80
+    delay: 20
+    timeout: 300
+
+- name: Check Appsmith HTTP endpoint
+  uri:
+    url: http://localhost
+    status_code: 200,302
+    timeout: 10
+  register: http_health
+  retries: 15
+  delay: 10
+  until: http_health.status in [200, 302]
+
+- name: Verify Appsmith container health
+  shell: |
+    docker ps --filter "name=appsmith" --format "{{.Status}}"
+  register: container_status
+  until: "'healthy' in container_status.stdout or 'Up' in container_status.stdout"
+  retries: 15
+  delay: 5
+
+- name: Check Appsmith application health
+  uri:
+    url: http://localhost/api/v1/health
+    status_code: 200
+    timeout: 10
+  register: app_health
+  failed_when: false
+  retries: 5
+  delay: 10
+
+##################################################
+# VERIFY
+##################################################
+
+- name: Verify Appsmith container
+  shell: docker ps | grep appsmith
+  register: appsmith_verify
+
+- debug:
+    var: appsmith_verify.stdout
+
+##################################################
+# ROLLBACK ON FAILURE
+##################################################
+
+- name: Find latest backup file
+  shell: |
+    ls -t /opt/appsmith/docker-compose.yml.bak_* | head -1
+  register: latest_backup
+  failed_when: false
+  when: appsmith_verify.rc != 0
+
+- name: Restore backup compose file
+  shell: |
+    cp {{ latest_backup.stdout }} /opt/appsmith/docker-compose.yml
+  when: 
+    - appsmith_verify.rc != 0
+    - latest_backup.stdout is defined
+
+- name: Pull previous image
+  shell: |
+    cd /opt/appsmith && docker compose pull
+  when: 
+    - appsmith_verify.rc != 0
+    - latest_backup.stdout is defined
+
+- name: Start Appsmith with previous version
+  shell: |
+    cd /opt/appsmith && docker compose up -d
+  when: 
+    - appsmith_verify.rc != 0
+    - latest_backup.stdout is defined
+
+- name: Wait for Appsmith rollback to be ready
+  wait_for:
+    host: 127.0.0.1
+    port: 80
+    delay: 20
+    timeout: 300
+  when: 
+    - appsmith_verify.rc != 0
+    - latest_backup.stdout is defined
