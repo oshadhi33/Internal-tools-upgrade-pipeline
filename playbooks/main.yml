@@ -1,0 +1,8 @@
+---
+- hosts: all
+  become: yes
+
+  tasks:
+
+    - name: Include app-specific upgrade tasks
+      include_tasks: "tasks/{{ target_app }}.yml"
