@@ -1,0 +1,126 @@
+apps:
+
+  - name: netdata
+    host_group: netdata
+    type: docker
+    upgrade_task: netdata.yml
+
+    current_version_command: >
+      docker exec netdata netdata -v
+
+    latest_version_api: >
+      https://api.github.com/repos/netdata/netdata/releases/latest
+
+    compose_path: /app/netdata/docker-compose.yml
+
+    healthcheck:
+      type: docker
+      container: netdata
+
+    rollback_supported: true
+
+  - name: outline
+    host_group: outline
+    type: docker
+    upgrade_task: outline.yml
+
+    current_version_command: >
+      docker compose -f /app/outline/docker-compose.yml images
+
+    latest_version_api: >
+      https://api.github.com/repos/outline/outline/releases/latest
+
+    compose_path: /app/outline/docker-compose.yml
+
+    healthcheck:
+      type: http
+      url: http://localhost:3000
+
+    rollback_supported: true
+
+  - name: gogs
+    host_group: gogs
+    type: binary
+    upgrade_task: gogs.yml
+
+    current_version_command: >
+      /mnt/HC_Volume_103566898/gogs/gogs --version
+
+    latest_version_api: >
+      https://api.github.com/repos/gogs/gogs/releases/latest
+
+    service_name: gogs.service
+
+    binary_path: /mnt/HC_Volume_103566898/gogs/gogs
+
+    healthcheck:
+      type: systemd
+      service: gogs.service
+
+    rollback_supported: true
+
+  - name: asset-manager
+    host_group: asset_manager
+    type: docker
+    upgrade_task: asset_manager.yml
+
+    current_version_command: >
+      docker images snipe/snipe-it
+
+    latest_version_api: >
+      https://api.github.com/repos/snipe/snipe-it/releases/latest
+
+    compose_path: /apps/snipe-it/docker-compose.yml
+
+    healthcheck:
+      type: http
+      url: https://assets.****.com
+
+    rollback_supported: true
+
+  - name: appsmith
+    host_group: appsmith
+    type: docker
+    upgrade_task: appsmith.yml
+
+    current_version_command: >
+      docker ps --format '{{.Image}}' | grep appsmith
+
+    latest_version_api: >
+      https://hub.docker.com/v2/repositories/appsmith/appsmith-ce/tags
+
+    compose_path: /opt/appsmith/docker-compose.yml
+
+    healthcheck:
+      type: http
+      url: http://localhost
+
+    rollback_supported: true
+
+    aws:
+      region: us-east-1
+      instance_id: i-0d2fb5d6f7b125976
+      volume_ids:
+        - vol-xxxxxxxx  
+        - vol-yyyyyyyy 
+
+  - name: azure-jenkins
+    host_group: jenkins
+    type: war
+    upgrade_task: jenkins.yml
+
+    current_version_command: >
+      java -jar /usr/lib/jenkins/jenkins.war --version
+
+    latest_version_api: >
+      https://updates.jenkins.io/stable/latestCore.txt
+
+    service_name: jenkins
+
+    war_path: /usr/lib/jenkins/jenkins.war
+
+    healthcheck:
+      type: systemd
+      service: jenkins
+
+    rollback_supported: true
